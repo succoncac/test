@@ -1,0 +1,101 @@
+import asyncio
+import subprocess
+import re
+from telegram import Update
+from telegram.ext import Application, CommandHandler, MessageHandler, filters, ContextTypes
+from telegram.constants import ParseMode
+from telegram.request import HTTPXRequest
+
+# --- THÔNG TIN CHIẾN LƯỢC ---
+TOKEN = '8589862869:AAExkuni4vIqw74yL6KWYnm5nvkfJvJNxjA'
+BOSS_USER_ID = 7934171537    
+API_KEY_LINK4M = "6981ed41aa416431716126eb"
+MY_COOKIE = "PHPSESSID=48b49bfe3f518c4b2c3934635788dec2"
+THUMB_IMAGE = "https://link4m.com/templates/default/IteckTheme/assets/img/thumb.jpg"
+
+async def is_boss(update: Update):
+    return update.effective_user.id == BOSS_USER_ID
+
+def get_all_links_from_web():
+    """Truy cập trang quản lý để lấy lại toàn bộ link cũ trong quá khứ"""
+    cmd = [
+        'curl', '-s', '-k', '-L',
+        '--cookie', MY_COOKIE,
+        '-A', 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36',
+        'https://link4m.com/member/links'
+    ]
+    html = subprocess.run(cmd, capture_output=True, text=True).stdout
+    
+    # Tìm tất cả các dòng chứa link và mã xóa trong bảng của Link4M
+    # Quét Link Gốc, Link Rút Gọn và Alias
+    items = []
+    # Regex này tìm cấu trúc bảng: Mã Alias, Link Gốc
+    found_aliases = re.findall(r'member/links/delete/([a-zA-Z0-9]+)', html)
+    found_origins = re.findall(r'class="text-ellipsis">([^<]+)</td>', html) # Link gốc thường nằm trong class này
+    
+    for i in range(min(len(found_aliases), len(found_origins))):
+        items.append({
+            "alias": found_aliases[i],
+            "goc": found_origins[i].strip(),
+            "rut": f"https://link4m.co/st/{found_aliases[i]}"
+        })
+    return items
+
+async def scan_all(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """Lệnh quét toàn bộ link trong quá khứ"""
+    if not await is_boss(update): return
+    
+    status = await context.bot.send_message(chat_id=BOSS_USER_ID, text="🔎 **Đang quét ngược quá khứ để tìm link cũ...**")
+    
+    loop = asyncio.get_event_loop()
+    links = await loop.run_in_executor(None, get_all_links_from_web)
+    
+    if not links:
+        await status.edit_text("📭 Không tìm thấy link nào trong kho dữ liệu của Boss.")
+        return
+
+    msg = "📂 **KHO LINK ĐÃ TẠO TRONG QUÁ KHỨ:**\n\n"
+    for i, item in enumerate(links[:10], 1): # Hiện 10 link gần nhất cho đỡ rối
+        msg += f"{i}. 🔗 Gốc: `{item['goc'][:25]}...`\n   🚀 Rút gọn: `{item['rut']}`\n   🗑 Mã xóa: `{item['alias']}`\n\n"
+    
+    msg += "💡 *Boss chỉ cần copy Mã xóa rồi gõ /xoa [mã] để hủy nhé!*"
+    await status.edit_text(msg, parse_mode=ParseMode.MARKDOWN)
+
+async def handle_link(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    if not await is_boss(update): return
+    raw_text = update.message.text.strip()
+    if raw_text.startswith('/'): return
+
+    status = await context.bot.send_message(chat_id=BOSS_USER_ID, text="⚡ **Đang xử lý link mới...**")
+    
+    # Logic tạo link (như bản trước nhưng tối ưu hơn)
+    target_url = f"https://link4m.co/st?api={API_KEY_LINK4M}&url={raw_text}"
+    cmd = ['curl', '-s', '-k', '-L', '--cookie', MY_COOKIE, target_url]
+    res = subprocess.run(cmd, capture_output=True, text=True).stdout
+    
+    final_link = next((l for l in re.findall(r'https?://link4m\.[^\s<>"]+', res) if "/st/" in l), None)
+    
+    if final_link:
+        alias = final_link.split('/')[-1]
+        msg = f"💎 **LINK MỚI ĐÃ SẴN SÀNG**\n\n🔗 Gốc: `{raw_text}`\n🚀 Rút gọn: `{final_link}`\n🗑 Mã xóa: `{alias}`"
+        await context.bot.send_photo(chat_id=BOSS_USER_ID, photo=THUMB_IMAGE, caption=msg, parse_mode=ParseMode.MARKDOWN)
+        await status.delete()
+    else:
+        await status.edit_text("❌ Lỗi tạo link. Check lại API/Cookie!")
+
+async def delete_links(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    if not await is_boss(update): return
+    for code in context.args:
+        subprocess.run(['curl', '-s', '-X', 'POST', '--cookie', MY_COOKIE, f"https://link4m.com/member/links/delete/{code}"])
+    await context.bot.send_message(chat_id=BOSS_USER_ID, text=f"🗑 Đã hủy sạch các link Boss yêu cầu!")
+
+if __name__ == '__main__':
+    t_request = HTTPXRequest(connect_timeout=60, read_timeout=60)
+    app = Application.builder().token(TOKEN).request(t_request).build()
+    
+    app.add_handler(CommandHandler("quatatca", scan_all))
+    app.add_handler(CommandHandler("xoa", delete_links))
+    app.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, handle_link))
+    
+    print("Hệ thống 'Quét ngược quá khứ' đang chạy...")
+    app.run_polling(drop_pending_updates=True)
